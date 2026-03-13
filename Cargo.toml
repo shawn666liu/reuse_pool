@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Shawn Liu <shawn666.liu@hotmail.com>"]
 description = "高性能、线程安全的可复用对象池库"
+repository = "https://github.com/shawn666liu/reuse_pool.git"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 crossbeam = { version = "0.8" }
