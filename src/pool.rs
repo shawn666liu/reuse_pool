@@ -32,7 +32,7 @@ impl<T: Send> Queue<T> for SegQueue<T> {
 }
 
 /// 对象池：支持有界/无界队列，通过工厂函数创建新对象。
-pub struct Pool<T: Send + 'static, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
+pub struct Pool<T: Send, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
     free: Q,
     max_idle: Option<usize>, // None 表示无界，Some 表示有界容量（仅用于监控）
     idle_count: AtomicUsize, // 当前空闲对象数量
@@ -41,7 +41,7 @@ pub struct Pool<T: Send + 'static, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
     _phantom: PhantomData<T>, // 标记 T 被使用
 }
 
-impl<T: Send + 'static> Pool<T, SegQueue<Box<T>>> {
+impl<T: Send> Pool<T, SegQueue<Box<T>>> {
     /// 创建无界对象池，使用默认工厂函数（要求 T: Default）
     pub fn new_unbounded() -> Arc<Self>
     where
@@ -51,17 +51,25 @@ impl<T: Send + 'static> Pool<T, SegQueue<Box<T>>> {
     }
 }
 
-impl<T: Send + 'static> Pool<T, ArrayQueue<Box<T>>> {
+impl<T: Send> Pool<T, ArrayQueue<Box<T>>> {
     /// 创建有界对象池，使用默认工厂函数（要求 T: Default）
     pub fn new_bounded(max_idle: usize) -> Arc<Self>
     where
         T: Default,
     {
-        Self::with_factory(ArrayQueue::new(max_idle), Some(max_idle), || T::default())
+        let free = ArrayQueue::new(max_idle);
+        Arc::new(Self {
+            free,
+            max_idle: Some(max_idle),
+            idle_count: AtomicUsize::new(0),
+            created: AtomicUsize::new(0),
+            factory: Box::new(|| T::default()),
+            _phantom: PhantomData,
+        })
     }
 }
 
-impl<T: Send + 'static, Q: Queue<Box<T>>> Pool<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> Pool<T, Q> {
     /// 通用构造函数，接受队列、最大空闲数（可选）和工厂函数。
     pub fn with_factory<F>(free: Q, max_idle: Option<usize>, factory: F) -> Arc<Self>
     where
@@ -117,7 +125,7 @@ impl<T: Send + 'static, Q: Queue<Box<T>>> Pool<T, Q> {
     /// 从池中获取一个可变守卫（用于填充数据）, 使用自定义工厂
     pub fn get_with<F>(self: &Arc<Self>, factory: F) -> PooledMut<T, Q>
     where
-        F: FnOnce() -> T + Send + 'static,
+        F: FnOnce() -> T + Send,
     {
         let obj = if let Some(obj) = self.free.pop() {
             self.idle_count.fetch_sub(1, Ordering::Relaxed);
@@ -134,12 +142,12 @@ impl<T: Send + 'static, Q: Queue<Box<T>>> Pool<T, Q> {
 }
 
 /// 可变守卫：独占访问，用于填充数据。
-pub struct PooledMut<T: Send + 'static, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
+pub struct PooledMut<T: Send, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
     pool: Weak<Pool<T, Q>>,
     inner: Option<Box<T>>,
 }
 
-impl<T: Send + 'static, Q: Queue<Box<T>>> PooledMut<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> PooledMut<T, Q> {
     /// 获取可变引用（填充）
     pub fn as_mut(&mut self) -> &mut T {
         self.inner
@@ -168,20 +176,20 @@ impl<T: Send + 'static, Q: Queue<Box<T>>> PooledMut<T, Q> {
     }
 }
 
-impl<T: Send + 'static, Q: Queue<Box<T>>> std::ops::Deref for PooledMut<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> std::ops::Deref for PooledMut<T, Q> {
     type Target = T;
     fn deref(&self) -> &T {
         self.as_ref()
     }
 }
 
-impl<T: Send + 'static, Q: Queue<Box<T>>> std::ops::DerefMut for PooledMut<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> std::ops::DerefMut for PooledMut<T, Q> {
     fn deref_mut(&mut self) -> &mut T {
         self.as_mut()
     }
 }
 
-impl<T: Send + 'static, Q: Queue<Box<T>>> Drop for PooledMut<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> Drop for PooledMut<T, Q> {
     fn drop(&mut self) {
         if let Some(obj) = self.inner.take() {
             if let Some(pool) = self.pool.upgrade() {
@@ -192,12 +200,12 @@ impl<T: Send + 'static, Q: Queue<Box<T>>> Drop for PooledMut<T, Q> {
 }
 
 /// 共享内部结构，由 Arc 管理，在 Drop 时归还 Box 给池
-struct SharedInner<T: Send + 'static, Q: Queue<Box<T>>> {
+struct SharedInner<T: Send, Q: Queue<Box<T>>> {
     obj: Option<Box<T>>,
     pool: Weak<Pool<T, Q>>,
 }
 
-impl<T: Send + 'static, Q: Queue<Box<T>>> Drop for SharedInner<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> Drop for SharedInner<T, Q> {
     fn drop(&mut self) {
         if let Some(obj) = self.obj.take() {
             if let Some(pool) = self.pool.upgrade() {
@@ -208,11 +216,11 @@ impl<T: Send + 'static, Q: Queue<Box<T>>> Drop for SharedInner<T, Q> {
 }
 
 /// 共享只读对象：可克隆，最后一个销毁时自动归还
-pub struct Pooled<T: Send + 'static, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
+pub struct Pooled<T: Send, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
     inner: Arc<SharedInner<T, Q>>,
 }
 
-impl<T: Send + 'static, Q: Queue<Box<T>>> Clone for Pooled<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> Clone for Pooled<T, Q> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -220,7 +228,7 @@ impl<T: Send + 'static, Q: Queue<Box<T>>> Clone for Pooled<T, Q> {
     }
 }
 
-impl<T: Send + 'static, Q: Queue<Box<T>>> std::ops::Deref for Pooled<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> std::ops::Deref for Pooled<T, Q> {
     type Target = T;
     fn deref(&self) -> &T {
         self.inner
