@@ -1,5 +1,6 @@
 use crossbeam::queue::{ArrayQueue, SegQueue};
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -32,30 +33,34 @@ impl<T: Send> Queue<T> for SegQueue<T> {
 }
 
 /// 对象池：支持有界/无界队列，通过工厂函数创建新对象。
-pub struct Pool<T: Send, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
+pub struct Pool<T: Send, Q: Queue<Box<T>> = ArrayQueue<Box<T>>> {
     free: Q,
     max_idle: Option<usize>, // None 表示无界，Some 表示有界容量（仅用于监控）
     idle_count: AtomicUsize, // 当前空闲对象数量
     created: AtomicUsize,    // 累计创建对象数量
+    destroyed: AtomicUsize,  // 累计销毁对象数量
     factory: Box<dyn Fn() -> T + Send + Sync>, // 创建新对象的工厂函数
     _phantom: PhantomData<T>, // 标记 T 被使用
+    name: String,            // 池名称（用于日志或调试）
 }
 
 impl<T: Send> Pool<T, SegQueue<Box<T>>> {
     /// 创建无界对象池，使用默认工厂函数（要求 T: Default）
-    pub fn new_unbounded() -> Arc<Self>
+    pub fn new_unbounded<N>(name: N) -> Arc<Self>
     where
         T: Default,
+        N: Into<String>,
     {
-        Self::with_factory(SegQueue::new(), None, || T::default())
+        Self::with_factory(SegQueue::new(), None, || T::default(), name)
     }
 }
 
 impl<T: Send> Pool<T, ArrayQueue<Box<T>>> {
     /// 创建有界对象池，使用默认工厂函数（要求 T: Default）
-    pub fn new_bounded(max_idle: usize) -> Arc<Self>
+    pub fn new_bounded<N>(max_idle: usize, name: N) -> Arc<Self>
     where
         T: Default,
+        N: Into<String>,
     {
         let free = ArrayQueue::new(max_idle);
         Arc::new(Self {
@@ -63,47 +68,62 @@ impl<T: Send> Pool<T, ArrayQueue<Box<T>>> {
             max_idle: Some(max_idle),
             idle_count: AtomicUsize::new(0),
             created: AtomicUsize::new(0),
+            destroyed: AtomicUsize::new(0),
             factory: Box::new(|| T::default()),
             _phantom: PhantomData,
+            name: name.into(),
         })
     }
 }
 
 impl<T: Send, Q: Queue<Box<T>>> Pool<T, Q> {
     /// 通用构造函数，接受队列、最大空闲数（可选）和工厂函数。
-    pub fn with_factory<F>(free: Q, max_idle: Option<usize>, factory: F) -> Arc<Self>
+    pub fn with_factory<F, N>(free: Q, max_idle: Option<usize>, factory: F, name: N) -> Arc<Self>
     where
         F: Fn() -> T + Send + Sync + 'static,
+        N: Into<String>,
     {
         Arc::new(Self {
             free,
             max_idle,
             idle_count: AtomicUsize::new(0),
             created: AtomicUsize::new(0),
+            destroyed: AtomicUsize::new(0),
             factory: Box::new(factory),
             _phantom: PhantomData,
+            name: name.into(),
         })
     }
 
-    /// 归还对象（内部方法）——不再自动 reset，直接入队
+    /// 归还对象（内部方法）
     fn put(&self, obj: Box<T>) {
         match self.free.push(obj) {
             Ok(()) => {
                 self.idle_count.fetch_add(1, Ordering::Relaxed);
             }
             Err(_obj) => {
+                self.destroyed.fetch_add(1, Ordering::Relaxed);
                 // 队列满，对象被丢弃（_obj 在此作用域结束时 drop）
-                // 可在此添加日志
             }
         }
     }
 
-    /// 获取池状态：(空闲数, 最大空闲(如果有), 累计创建)
-    pub fn status(&self) -> (usize, Option<usize>, usize) {
+    /// 池名称，用于日志或调试
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 有界容器的最大空闲(无界容器为None)
+    pub fn max_idle(&self) -> Option<usize> {
+        self.max_idle
+    }
+
+    /// 获取池状态：(空闲数, 累计创建, 累计销毁)
+    pub fn status(&self) -> (usize, usize, usize) {
         (
             self.idle_count.load(Ordering::Relaxed),
-            self.max_idle,
             self.created.load(Ordering::Relaxed),
+            self.destroyed.load(Ordering::Relaxed),
         )
     }
 
@@ -176,14 +196,14 @@ impl<T: Send, Q: Queue<Box<T>>> PooledMut<T, Q> {
     }
 }
 
-impl<T: Send, Q: Queue<Box<T>>> std::ops::Deref for PooledMut<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> Deref for PooledMut<T, Q> {
     type Target = T;
     fn deref(&self) -> &T {
         self.as_ref()
     }
 }
 
-impl<T: Send, Q: Queue<Box<T>>> std::ops::DerefMut for PooledMut<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> DerefMut for PooledMut<T, Q> {
     fn deref_mut(&mut self) -> &mut T {
         self.as_mut()
     }
@@ -228,7 +248,7 @@ impl<T: Send, Q: Queue<Box<T>>> Clone for Pooled<T, Q> {
     }
 }
 
-impl<T: Send, Q: Queue<Box<T>>> std::ops::Deref for Pooled<T, Q> {
+impl<T: Send, Q: Queue<Box<T>>> Deref for Pooled<T, Q> {
     type Target = T;
     fn deref(&self) -> &T {
         self.inner
@@ -286,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_pool() {
-        let pool = Pool::<TickData>::new_unbounded();
+        let pool = Pool::<TickData>::new_bounded(20, "test_pool");
 
         // 第一次获取
         let mut guard = pool.get();
@@ -311,7 +331,7 @@ mod tests {
         drop(tick); // 最后一个引用，触发归还
 
         // 此时池中应有一个空闲对象
-        let (idle, _, _created) = pool.status();
+        let (idle, _created, _destroyed) = pool.status();
         assert_eq!(idle, 1);
 
         // 第二次获取应复用
@@ -330,17 +350,19 @@ mod tests {
         );
         let _tick2 = guard2.freeze();
 
-        let (_idle2, _, created2) = pool.status();
+        let (_idle2, created2, _destroyed2) = pool.status();
         // 创建数应为1（只创建了一次）
         assert_eq!(created2, 1);
     }
 
+    type TickPool = Pool<TickData, SegQueue<Box<TickData>>>;
+
     #[test]
     fn test_cross_thread_release() {
-        let pool = Pool::<TickData>::new_unbounded();
+        let pool = TickPool::new_unbounded("test_pool");
 
         // 初始状态：空闲0，创建0
-        let (idle0, _, created0) = pool.status();
+        let (idle0, created0, _destroyed0) = pool.status();
         assert_eq!(idle0, 0);
         assert_eq!(created0, 0);
 
@@ -361,7 +383,7 @@ mod tests {
         let tick = guard.freeze();
 
         // 此时池中空闲0，创建1
-        let (idle1, _, created1) = pool.status();
+        let (idle1, created1, _destroyed1) = pool.status();
         assert_eq!(idle1, 0);
         assert_eq!(created1, 1);
 
@@ -374,7 +396,7 @@ mod tests {
         handle.join().unwrap();
 
         // 验证对象已归还
-        let (idle2, _, created2) = pool.status();
+        let (idle2, created2, _destroyed2) = pool.status();
         assert_eq!(idle2, 1); // 空闲数变为1
         assert_eq!(created2, 1); // 创建数不变
     }
