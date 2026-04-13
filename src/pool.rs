@@ -162,7 +162,7 @@ impl<T: Send, Q: Queue<Box<T>>> Pool<T, Q> {
 }
 
 /// 可变守卫：独占访问，用于填充数据。
-pub struct PooledMut<T: Send, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
+pub struct PooledMut<T: Send, Q: Queue<Box<T>> = ArrayQueue<Box<T>>> {
     pool: Weak<Pool<T, Q>>,
     inner: Option<Box<T>>,
 }
@@ -236,7 +236,7 @@ impl<T: Send, Q: Queue<Box<T>>> Drop for SharedInner<T, Q> {
 }
 
 /// 共享只读对象：可克隆，最后一个销毁时自动归还
-pub struct Pooled<T: Send, Q: Queue<Box<T>> = SegQueue<Box<T>>> {
+pub struct Pooled<T: Send, Q: Queue<Box<T>> = ArrayQueue<Box<T>>> {
     inner: Arc<SharedInner<T, Q>>,
 }
 
