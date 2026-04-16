@@ -220,6 +220,7 @@ impl<T: Send, Q: Queue<Box<T>>> Drop for PooledMut<T, Q> {
 }
 
 /// 共享内部结构，由 Arc 管理，在 Drop 时归还 Box 给池
+#[derive(Debug)]
 struct SharedInner<T: Send, Q: Queue<Box<T>>> {
     obj: Option<Box<T>>,
     pool: Weak<Pool<T, Q>>,
@@ -236,6 +237,7 @@ impl<T: Send, Q: Queue<Box<T>>> Drop for SharedInner<T, Q> {
 }
 
 /// 共享只读对象：可克隆，最后一个销毁时自动归还
+#[derive(Debug)]
 pub struct Pooled<T: Send, Q: Queue<Box<T>> = ArrayQueue<Box<T>>> {
     inner: Arc<SharedInner<T, Q>>,
 }
@@ -255,6 +257,42 @@ impl<T: Send, Q: Queue<Box<T>>> Deref for Pooled<T, Q> {
             .obj
             .as_ref()
             .expect("Pooled inner obj should be Some in deref")
+    }
+}
+
+impl<T: Send, Q: Queue<Box<T>>> Pooled<T, Q> {
+    /// 将共享只读对象还原为可变对象
+    ///
+    /// 只有当 Arc 引用计数为1时（即没有其他引用）才能成功还原
+    /// 如果存在其他引用，则返回 Err(self)
+    pub fn unfreeze(self) -> Result<PooledMut<T, Q>, Self> {
+        // 检查 Arc 引用计数是否为1
+        if Arc::strong_count(&self.inner) == 1 {
+            // 使用 Arc::try_unwrap 尝试获取内部值
+            match Arc::try_unwrap(self.inner) {
+                Ok(mut shared_inner) => {
+                    // 使用 Option::take() 来安全地获取 obj
+                    let obj = shared_inner
+                        .obj
+                        .take()
+                        .expect("SharedInner obj should be Some in unfreeze");
+                    // 使用 mem::replace 来获取 pool，同时留下一个空的 Weak
+                    let pool = std::mem::replace(&mut shared_inner.pool, Weak::new());
+
+                    Ok(PooledMut {
+                        pool,
+                        inner: Some(obj),
+                    })
+                }
+                Err(arc) => {
+                    // 这种情况理论上不应该发生，因为我们已经检查了引用计数
+                    Err(Pooled { inner: arc })
+                }
+            }
+        } else {
+            // 存在其他引用，无法还原
+            Err(self)
+        }
     }
 }
 
@@ -399,5 +437,125 @@ mod tests {
         let (idle2, created2, _destroyed2) = pool.status();
         assert_eq!(idle2, 1); // 空闲数变为1
         assert_eq!(created2, 1); // 创建数不变
+    }
+
+    #[test]
+    fn test_unfreeze_success() {
+        let pool = Pool::<TickData>::new_bounded(20, "test_unfreeze");
+
+        // 获取 PooledMut 并填充数据
+        let mut pooled_mut = pool.get();
+        pooled_mut.fill(
+            "2024-05-20",
+            "ru2309",
+            "10:00:00.123",
+            6800.0,
+            1000,
+            50000,
+            6799.0,
+            6801.0,
+            500,
+            600,
+        );
+
+        // 冻结为 Pooled
+        let pooled = pooled_mut.freeze();
+
+        // 验证数据正确
+        assert_eq!(pooled.tradeday, "2024-05-20");
+        assert_eq!(pooled.last, 6800.0);
+
+        // 成功还原为 PooledMut（没有其他引用）
+        let mut pooled_mut_again = pooled.unfreeze().expect("Should unfreeze successfully");
+
+        // 修改数据
+        pooled_mut_again.last = 6801.0;
+
+        // 验证修改生效
+        assert_eq!(pooled_mut_again.last, 6801.0);
+
+        // 再次冻结
+        let pooled_final = pooled_mut_again.freeze();
+        assert_eq!(pooled_final.last, 6801.0);
+    }
+
+    #[test]
+    fn test_unfreeze_failure() {
+        let pool = Pool::<TickData>::new_bounded(20, "test_unfreeze_failure");
+
+        // 获取 PooledMut 并填充数据
+        let mut pooled_mut = pool.get();
+        pooled_mut.fill(
+            "2024-05-20",
+            "ru2309",
+            "10:00:00.123",
+            6800.0,
+            1000,
+            50000,
+            6799.0,
+            6801.0,
+            500,
+            600,
+        );
+
+        // 冻结为 Pooled
+        let pooled = pooled_mut.freeze();
+
+        // 创建另一个引用
+        let pooled_clone = pooled.clone();
+
+        // 尝试还原应该失败（因为有其他引用）
+        let result = pooled.unfreeze();
+        assert!(result.is_err());
+
+        // 获取错误值
+        let pooled_again = result.err().unwrap();
+
+        // 验证原对象仍然可用
+        assert_eq!(pooled_again.tradeday, "2024-05-20");
+        assert_eq!(pooled_clone.tradeday, "2024-05-20");
+
+        // 释放克隆引用
+        drop(pooled_clone);
+
+        // 现在应该可以成功还原
+        let pooled_mut_final = pooled_again
+            .unfreeze()
+            .expect("Should unfreeze after clone dropped");
+        assert_eq!(pooled_mut_final.last, 6800.0);
+    }
+
+    #[test]
+    fn test_unfreeze_multiple_cycles() {
+        let pool = Pool::<TickData>::new_bounded(20, "test_unfreeze_cycles");
+
+        let mut pooled_mut = pool.get();
+        pooled_mut.fill(
+            "2024-05-20",
+            "ru2309",
+            "10:00:00.123",
+            6800.0,
+            1000,
+            50000,
+            6799.0,
+            6801.0,
+            500,
+            600,
+        );
+
+        // 多次 freeze/unfreeze 循环
+        let pooled = pooled_mut.freeze();
+        let mut pooled_mut2 = pooled.unfreeze().unwrap();
+        pooled_mut2.last = 6801.0;
+
+        let pooled2 = pooled_mut2.freeze();
+        let mut pooled_mut3 = pooled2.unfreeze().unwrap();
+        pooled_mut3.last = 6802.0;
+
+        let pooled3 = pooled_mut3.freeze();
+
+        // 验证最终值
+        assert_eq!(pooled3.last, 6802.0);
+        assert_eq!(pooled3.tradeday, "2024-05-20");
     }
 }
